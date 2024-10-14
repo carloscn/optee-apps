@@ -1,0 +1,1 @@
+copy entire folder to optee_examples root
