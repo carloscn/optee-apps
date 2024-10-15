@@ -29,17 +29,22 @@
 #include <tee_internal_api_extensions.h>
 
 #include <tee_kms_signer.h>
+#include <stdint.h>
+#include <string.h>
 #include "mbedtls/platform.h"
 #include <mbedtls/rsa.h>
 #include <mbedtls/pk.h>
 #include "mbedtls/md.h"
 #include <mbedtls/sha256.h>
 #include <mbedtls/error.h>
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+
 // $ openssl genpkey -algorithm RSA -out private_key.pem -pkeyopt rsa_keygen_bits:2048
 // $ openssl pkcs8 -topk8 -inform PEM -outform DER -in private_key.pem -out private_key.der -nocrypt
 // $ xxd -i private_key.der > rsa_key_2048.c
 // $ openssl rsa -in private_key.pem -pubout -out public_key.pem
-static const unsigned char private_key_der[] = {
+static const uint8_t private_key_der[] = {
   0x30, 0x82, 0x04, 0xbd, 0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a,
   0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x04, 0x82,
   0x04, 0xa7, 0x30, 0x82, 0x04, 0xa3, 0x02, 0x01, 0x00, 0x02, 0x82, 0x01,
@@ -143,7 +148,8 @@ static const unsigned char private_key_der[] = {
   0xec, 0x38, 0x3c, 0xf6, 0x4c, 0x96, 0x94, 0x9b, 0xdd, 0x29, 0xc4, 0xae,
   0xb8, 0x0f, 0x3a, 0xb2, 0x99
 };
-static size_t private_key_der_len = 1217;
+
+//static size_t private_key_der_len = 1217;
 
 #define SIGNATURE_BUFFER_SIZE 256
 
@@ -153,7 +159,7 @@ static size_t private_key_der_len = 1217;
  */
 TEE_Result TA_CreateEntryPoint(void)
 {
-    DMSG("has been called");
+    DMSG("TA_CreateEntryPoint has been called\n");
 
     return TEE_SUCCESS;
 }
@@ -164,7 +170,7 @@ TEE_Result TA_CreateEntryPoint(void)
  */
 void TA_DestroyEntryPoint(void)
 {
-    DMSG("has been called");
+    DMSG("TA_DestroyEntryPoint has been called\n");
 }
 
 /*
@@ -182,7 +188,7 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
                            TEE_PARAM_TYPE_NONE,
                            TEE_PARAM_TYPE_NONE);
 
-    DMSG("has been called");
+    DMSG("TA_OpenSessionEntryPoint has been called\n");
 
     if (param_types != exp_param_types)
         return TEE_ERROR_BAD_PARAMETERS;
@@ -190,12 +196,6 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
     /* Unused parameters */
     (void)&params;
     (void)&sess_ctx;
-
-    /*
-     * The DMSG() macro is non-standard, TEE Internal API doesn't
-     * specify any means to logging from a TA.
-     */
-    IMSG("Hello World!\n");
 
     /* If return value != TEE_SUCCESS the session will not be created. */
     return TEE_SUCCESS;
@@ -211,44 +211,84 @@ void TA_CloseSessionEntryPoint(void __maybe_unused *sess_ctx)
     IMSG("Goodbye!\n");
 }
 
-static TEE_Result inc_value(uint32_t param_types,
-    TEE_Param params[4])
+static int optee_os_random(void *data, unsigned char *output, size_t size)
 {
-    uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INOUT,
-                           TEE_PARAM_TYPE_NONE,
-                           TEE_PARAM_TYPE_NONE,
-                           TEE_PARAM_TYPE_NONE);
-
-    DMSG("has been called");
-
-    if (param_types != exp_param_types)
-        return TEE_ERROR_BAD_PARAMETERS;
-
-    IMSG("Got value: %u from NW", params[0].value.a);
-    params[0].value.a++;
-    IMSG("Increase value to: %u", params[0].value.a);
-
-    return TEE_SUCCESS;
+    ((void) data);
+    TEE_GenerateRandom(output, size);
+    return 0;
 }
 
-static TEE_Result dec_value(uint32_t param_types,
-    TEE_Param params[4])
-{
-    uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INOUT,
-                           TEE_PARAM_TYPE_NONE,
-                           TEE_PARAM_TYPE_NONE,
-                           TEE_PARAM_TYPE_NONE);
+static int mbedtls_perform_sign(const uint8_t *in,
+                                const size_t in_len,
+                                const uint8_t *pri_key,
+                                size_t key_length,
+                                unsigned char *out,
+                                size_t *out_len) {
+    int ret = 0;
+    unsigned char hash[MBEDTLS_MD_MAX_SIZE];
+    mbedtls_pk_context pk;
+    mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+    uint8_t *key_copy = NULL;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    const char *pers = "mbedtls_pk_sign";
+	const char *error_buf = "hee";
+    // Initialize context
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_pk_init(&pk);
+    // Allocate memory for private key and copy it
+    key_copy = TEE_Malloc(key_length, TEE_MALLOC_FILL_ZERO);
+    if (!key_copy) {
+        EMSG("Failed to allocate memory for private key\n");
+        return -1;
+    }
+    TEE_MemMove(key_copy, pri_key, key_length);
 
-    DMSG("has been called");
+    // Initialize context
+    mbedtls_pk_init(&pk);
+	IMSG("Call mbedtls_ctr_drbg_seed");
+    // Seed the random number generator
+    ret = mbedtls_ctr_drbg_seed(&ctr_drbg, optee_os_random, &entropy, (const unsigned char *)pers, strlen(pers));
+    if (ret != 0) {
+        printf("Failed to seed RNG: %s\n", error_buf);
+        goto cleanup;
+    }
 
-    if (param_types != exp_param_types)
-        return TEE_ERROR_BAD_PARAMETERS;
+    IMSG("Call mbedtls_pk_parse_key\n");
+    // Parse private key
+    ret = mbedtls_pk_parse_key(&pk, key_copy, key_length, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg);
+    if (ret != 0) {
+        printf("Failed to parse private key: %s\n", error_buf);
+        goto cleanup;
+    }
 
-    IMSG("Got value: %u from NW", params[0].value.a);
-    params[0].value.a--;
-    IMSG("Decrease value to: %u", params[0].value.a);
+    // Compute message digest
+    ret = mbedtls_md(mbedtls_md_info_from_type(md_type), in, in_len, hash);
+    if (ret != 0) {
+        printf("Failed to compute message digest: %s\n", error_buf);
+        goto cleanup;
+    }
 
-    return TEE_SUCCESS;
+    IMSG("Call mbedtls_pk_sign\n");
+    // Sign the digest using the private key
+    ret = mbedtls_pk_sign(&pk, md_type, hash, 0,
+                          out, MBEDTLS_PK_SIGNATURE_MAX_SIZE, out_len, mbedtls_ctr_drbg_random, &ctr_drbg);
+    if (ret != 0) {
+        printf("Failed to sign message: %s\n", error_buf);
+        goto cleanup;
+    }
+
+cleanup:
+    // Clean up resources
+    mbedtls_pk_free(&pk);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_entropy_free(&entropy);
+    if (key_copy) {
+        TEE_Free(key_copy);
+    }
+
+    return ret;
 }
 
 static TEE_Result kms_signer(uint32_t param_types, TEE_Param params[4])
@@ -258,9 +298,7 @@ static TEE_Result kms_signer(uint32_t param_types, TEE_Param params[4])
                                                TEE_PARAM_TYPE_VALUE_INPUT,
                                                TEE_PARAM_TYPE_NONE);
     TEE_Result res = TEE_SUCCESS;
-    mbedtls_pk_context pk;
-    mbedtls_rsa_context *rsa;
-    uint8_t hash[32]; // SHA-256 hash size
+    size_t o_len = SIGNATURE_BUFFER_SIZE;
 
     if (param_types != exp_param_types)
         return TEE_ERROR_BAD_PARAMETERS;
@@ -278,32 +316,21 @@ static TEE_Result kms_signer(uint32_t param_types, TEE_Param params[4])
         return TEE_ERROR_BAD_PARAMETERS;
     }
 
-    mbedtls_pk_init(&pk);
-
-    if (mbedtls_pk_parse_key(&pk, private_key_der, private_key_der_len, NULL, 0, NULL, 0) != 0) {
-        EMSG("Failed to parse RSA key");
-        return TEE_ERROR_BAD_PARAMETERS;
-    }
-
-    rsa = mbedtls_pk_rsa(pk);
-
-    if (mbedtls_sha256(data, data_size, hash, 0) != 0) {
-        EMSG("Hashing failed");
+	if (mbedtls_perform_sign(data,
+							 data_size,
+							 private_key_der,
+							 sizeof(private_key_der),
+							 signed_data,
+							 &o_len) != 0) {
+        EMSG("mbedtls_perform_sign failed!");
         return TEE_ERROR_GENERIC;
-    }
-
-    if (mbedtls_rsa_pkcs1_sign(rsa, NULL, NULL, MBEDTLS_MD_SHA256, 32, hash, signed_data) != 0) {
-        EMSG("Signing failed");
-        return TEE_ERROR_GENERIC;
-    }
+	}
 
     // Set the output signature back to the caller
     params[1].memref.buffer = signed_data;
-    params[1].memref.size = SIGNATURE_BUFFER_SIZE;
+    params[1].memref.size = o_len;
+	*signed_data_size = o_len;
 
-    *signed_data_size = 32;
-
-    mbedtls_pk_free(&pk);
     return res;
 }
 
@@ -321,10 +348,10 @@ TEE_Result TA_InvokeCommandEntryPoint(void __maybe_unused *sess_ctx,
     switch (cmd_id) {
     case TA_TEE_KMS_SIGNER_CMD_INC_VALUE:
         IMSG("Calros test : TA_TEE_KMS_SIGNER_CMD_INC_VALUE\n");
-        return inc_value(param_types, params);
+        return 0;
     case TA_TEE_KMS_SIGNER_CMD_DEC_VALUE:
         IMSG("Calros test : TA_TEE_KMS_SIGNER_CMD_DEC_VALUE\n");
-        return dec_value(param_types, params);
+        return 0;
     case TA_TEE_KMS_SIGNER_CMD_SIGN:
         IMSG("Call TEE signer");
         return kms_signer(param_types, params);
